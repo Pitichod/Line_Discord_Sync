@@ -1,6 +1,7 @@
 {
   "name": "line-discord-sync",
   "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",

@@ -1,3 +1,6 @@
+// LINE ↔ Discord Sync — Made with ❤️ by Pitichod.
+// Required Notice: Copyright (c) 2026 Pitichod. See LICENSE for reuse terms.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import { DurableObject } from "cloudflare:workers";
 
 const encoder = new TextEncoder();
@@ -170,6 +173,8 @@ export class DiscordGateway extends DurableObject {
       const metadata = await this.ctx.storage.get(`pairmeta:${channelId}`);
       if (guildId && metadata?.guildId && metadata.guildId !== guildId) return Response.json({ ok: false }, { status: 403 });
       if (!guildId && (!metadata || metadata.guildId || metadata.ownerId !== userId)) return Response.json({ ok: false }, { status: 403 });
+      await this.deleteReplyMappings(lineTarget);
+      await this.deleteLineWebhook(channelId);
       await this.ctx.storage.delete(`discord:${channelId}`);
       await this.ctx.storage.delete(`line:${lineTarget}`);
       await this.ctx.storage.delete(`pairmeta:${channelId}`);
@@ -185,17 +190,60 @@ export class DiscordGateway extends DurableObject {
   }
 
   async createPairCode(details) {
+    await this.prunePendingPairCodes();
+    const channelKey = `pending-channel:${details.channelId}`;
+    const activeCode = await this.ctx.storage.get(channelKey);
+    if (activeCode) {
+      const activePair = await this.ctx.storage.get(`pending:${activeCode}`);
+      if (activePair?.expiresAt > Date.now()) return activeCode;
+      await this.deletePendingPairCode(activeCode, activePair);
+    }
+
     const random = new Uint8Array(6);
     for (let attempt = 0; attempt < 5; attempt++) {
       crypto.getRandomValues(random);
       const code = Array.from(random, (byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
       const key = `pending:${code}`;
       if (!(await this.ctx.storage.get(key))) {
-        await this.ctx.storage.put(key, { ...details, expiresAt: Date.now() + 10 * 60 * 1000 });
+        const expiresAt = Date.now() + 10 * 60 * 1000;
+        await this.ctx.storage.put(key, { ...details, expiresAt });
+        await this.ctx.storage.put(`pending-expiry:${String(expiresAt).padStart(13, "0")}:${code}`, code);
+        await this.ctx.storage.put(channelKey, code);
         return code;
       }
     }
     throw new Error("Could not generate a unique pairing code");
+  }
+
+  async prunePendingPairCodes() {
+    const now = Date.now();
+    const entries = await this.ctx.storage.list({ prefix: "pending-expiry:", limit: 1000 });
+    for (const [indexKey, code] of entries) {
+      const expiresAt = Number(indexKey.split(":")[1]);
+      if (Number.isFinite(expiresAt) && expiresAt > now) break;
+      await this.deletePendingPairCode(code, null, indexKey);
+    }
+
+    // Remove expired records created before the expiry index was introduced.
+    const legacyEntries = await this.ctx.storage.list({ prefix: "pending:", limit: 1000 });
+    for (const [key, pending] of legacyEntries) {
+      if (pending?.expiresAt > now) continue;
+      const code = key.slice("pending:".length);
+      await this.deletePendingPairCode(code, pending);
+    }
+  }
+
+  async deletePendingPairCode(code, pending = null, indexKey = null) {
+    const record = pending || await this.ctx.storage.get(`pending:${code}`);
+    await this.ctx.storage.delete(`pending:${code}`);
+    if (indexKey) await this.ctx.storage.delete(indexKey);
+    else if (record?.expiresAt) {
+      await this.ctx.storage.delete(`pending-expiry:${String(record.expiresAt).padStart(13, "0")}:${code}`);
+    }
+    if (record?.channelId) {
+      const channelKey = `pending-channel:${record.channelId}`;
+      if (await this.ctx.storage.get(channelKey) === code) await this.ctx.storage.delete(channelKey);
+    }
   }
 
   async getLineTargetForChannel(channelId) {
@@ -441,6 +489,19 @@ export class DiscordGateway extends DurableObject {
     }
   }
 
+  async deleteReplyMappings(lineTarget) {
+    const entries = await this.ctx.storage.list({ prefix: `reply-map:${lineTarget}:`, limit: 1000 });
+    for (const [key, record] of entries) {
+      for (const lineMessageId of record?.lineMessageIds || []) {
+        await this.ctx.storage.delete(`reply-line:${lineTarget}:${lineMessageId}`);
+      }
+      if (record?.discordMessageId) {
+        await this.ctx.storage.delete(`reply-discord:${lineTarget}:${record.discordMessageId}`);
+      }
+      await this.ctx.storage.delete(key);
+    }
+  }
+
   async getDiscordChannelForLine(lineTarget) {
     let channelId = await this.ctx.storage.get(`line:${lineTarget}`);
     if (!channelId && this.env.LEGACY_DISCORD_CHANNEL_ID && (await this.ctx.storage.get("lineTarget")) === lineTarget) {
@@ -460,6 +521,7 @@ export class DiscordGateway extends DurableObject {
     const key = `pending:${code}`;
     const pending = await this.ctx.storage.get(key);
     if (!pending || pending.expiresAt < Date.now()) {
+      if (pending) await this.deletePendingPairCode(code, pending);
       await this.sendLineText(lineTarget, "That pairing code is invalid or expired. Run `/pair` in Discord to get a new one.");
       return;
     }
@@ -472,7 +534,7 @@ export class DiscordGateway extends DurableObject {
     await this.ctx.storage.put(`discord:${pending.channelId}`, lineTarget);
     await this.ctx.storage.put(`line:${lineTarget}`, pending.channelId);
     await this.ctx.storage.put(`pairmeta:${pending.channelId}`, { guildId: pending.guildId || null, ownerId: pending.ownerId || null });
-    await this.ctx.storage.delete(key);
+    await this.deletePendingPairCode(code, pending);
     await this.sendLineText(lineTarget, "Connected to Discord. Messages and supported attachments will now sync to the paired channel.");
     await this.postDiscordMessage(pending.channelId, "This Discord channel is now paired with the LINE group.");
     console.log("Paired a LINE group and Discord channel");
@@ -637,6 +699,25 @@ export class DiscordGateway extends DurableObject {
       console.warn("Could not create LINE relay webhook; using bot messages instead", error?.message || "request failed");
       return null;
     }
+  }
+
+  async deleteLineWebhook(channelId) {
+    const key = `line-webhook:${channelId}`;
+    const webhook = await this.ctx.storage.get(key);
+    if (webhook?.id && this.env.DISCORD_BOT_TOKEN) {
+      try {
+        const response = await fetch(`https://discord.com/api/v10/webhooks/${webhook.id}`, {
+          method: "DELETE",
+          headers: { authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` },
+        });
+        if (!response.ok && response.status !== 404) {
+          console.warn("Could not delete LINE relay webhook", response.status);
+        }
+      } catch (error) {
+        console.warn("Could not delete LINE relay webhook", error?.message || "request failed");
+      }
+    }
+    await this.ctx.storage.delete(key);
   }
 
   async executeLineWebhook(webhook, content, file, username, avatarUrl) {

@@ -1,3 +1,6 @@
+// LINE ↔ Discord Sync — Made with ❤️ by Pitichod.
+// Required Notice: Copyright (c) 2026 Pitichod. See LICENSE for reuse terms.
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 const applicationId = process.env.DISCORD_APPLICATION_ID;
 const botToken = process.env.DISCORD_BOT_TOKEN;
 

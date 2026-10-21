@@ -2,7 +2,29 @@
 
 A two-way messaging bridge built with Cloudflare Workers. Pair LINE chats with Discord channels or direct messages, then relay text and supported attachments between them.
 
+Made with ❤️ by **Pitichod**.
+
 Each deployment uses one LINE Official Account and one Discord bot. Pair chats independently with `/pair`.
+
+## Project status and disclaimer
+
+This is my first time sharing a project publicly. I originally built it for personal use because I couldn't find a tool like this when I searched—or perhaps I just missed one. Please be kind if you spot a mistake, and feel free to contact me at [ninepitichod@gmail.com](mailto:ninepitichod@gmail.com). I may keep developing this project, or it may stay as it is. It is provided as-is, without a promise of support, uptime, or future updates. If you use the hosted bot or deploy this code, you accept the risks and are responsible for your own configuration and data. Thanks for understanding.
+
+## Try the hosted bot
+
+You can try the bot and LINE Official Account I operate without creating your own bot or deploying a Worker:
+
+- [Invite the Discord bot](https://discord.com/oauth2/authorize?client_id=1562370057760145418&scope=bot%20applications.commands&permissions=536972288)
+- [Add the LINE Official Account](https://line.me/R/ti/p/%40649iflwh) (LINE ID: `@649iflwh`)
+
+To connect your chats:
+
+1. Invite the Discord bot to your server. The person installing it needs permission to manage the server.
+2. Add the LINE Official Account as a friend. For a LINE group, add the Official Account to that group and allow it to join group chats in LINE Official Account settings.
+3. In the Discord channel you want to connect, run `/pair`. The person using `/pair` needs **Manage Channels**, **Manage Server**, or **Administrator** permission.
+4. In the LINE one-to-one chat or group you want to connect, send `!pair CODE` using the code from Discord. The code expires after 10 minutes.
+
+Each Discord channel or DM pairs with one LINE chat. Messages and supported attachments in paired chats pass through the Worker and the LINE and Discord bot accounts I operate. The bridge stores pairing details, temporary pairing codes, webhook credentials, and message IDs used for reply linking; it does not intentionally store message text or attachment contents. Reply-link records are kept for up to 30 days and are deleted when you run `/unpair`. See the [Privacy Notice](PRIVACY.md) for details. Shared usage consumes the service's provider quotas, so access may be limited or stopped if needed. Only pair chats whose members understand that messages may be relayed, and do not use the shared setup for sensitive conversations. The hosted service may be unavailable or change without notice.
 
 ## Features
 
@@ -30,11 +52,18 @@ In a Discord server, `/pair` requires **Manage Channels**, **Manage Server**, or
 - A Discord application and bot
 - A LINE Official Account with a Messaging API channel
 
-The Discord bot needs View Channel, **Read Message History**, Send Messages, Attach Files, and **Manage Webhooks** in each paired server channel. Without Manage Webhooks, regular LINE messages use a bot message in Discord instead of showing the LINE profile as the message author. Replies from LINE use the bot identity so Discord can render a native reply. Discord shows the bot name (LineSync) as the message author, with the LINE name and profile picture above the reply text in an embed. Discord DM pairings also use the bot's own identity.
+The Discord bot needs **View Channel**, **Read Message History**, **Send Messages**, **Attach Files**, and **Manage Webhooks** in each paired server channel. Without Manage Webhooks, regular LINE messages use the bot identity instead of showing the LINE profile as the author. Replies from LINE use the bot identity so Discord can render a native reply. Discord shows the bot name as the author, with the LINE name and profile picture above the reply text in an embed. Discord DM pairings also use the bot's own identity.
 
 For Discord message relaying, enable the **Message Content Intent** in the Discord Developer Portal. For LINE groups, enable **Allow bot to join group chats** and add the Official Account to each group.
 
+Before offering the hosted bot publicly, publish [PRIVACY.md](PRIVACY.md) at a public URL and enter that URL as the application's Privacy Policy URL in the Discord Developer Portal. Discord requires an application privacy policy describing data collection, use, sharing, and deletion requests. Discord also announced that apps reaching 10,000 users need review for continued access to message content, with annual reapplication; confirm the current requirements in [Discord's developer announcement](https://discord.com/blog/updated-requirements-to-how-apps-access-data-in-servers).
+
 ## Set up your own deployment
+
+For a self-hosted setup, create your own Discord application/bot and LINE Official Account/Messaging API channel. Use your own credentials; never copy credentials from the hosted setup.
+
+- [Create a Discord application](https://discord.com/developers/applications). Under **Bot**, create the bot, enable **Message Content Intent**, and copy its bot token. Copy the application's **Public Key** from **General Information**.
+- [Create a LINE Official Account and enable the Messaging API](https://developers.line.biz/en/docs/messaging-api/getting-started/). Copy the channel secret and issue a channel access token. For group chats, allow the Official Account to join group chats.
 
 ### 1. Install dependencies and authenticate Wrangler
 
@@ -127,14 +156,18 @@ npx wrangler tail
 - LINE text relayed to Discord cannot trigger Discord mentions such as `@everyone`.
 - Reply links are kept for the latest 500 relayed messages per paired chat, up to 30 days. LINE only provides quote tokens for supported message types, so some replies may arrive without a native quote preview.
 
-## Preparing this repository for public sharing
+## License and attribution
 
-Before making this particular repository public:
+Copyright belongs to **Pitichod**. Made with ❤️ by **Pitichod**. This project is provided under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, copy, modify, and share it for noncommercial purposes without asking first, as long as you include the license and keep the required copyright notice. The license restricts commercial use, with specific exceptions described in its full terms for certain charitable, educational, research, public safety/health, environmental, and government institutions. This is source-available software with a noncommercial restriction, not an OSI-approved open-source license. This is not legal advice; if an absolute ban on every revenue-generating use is essential, the standard license's stated exceptions mean you should get a custom license reviewed by a lawyer before publishing.
 
-1. `DISCORD_PUBLIC_KEY` is a public verification key, not a credential. Set it to your own application's key before deployment.
-2. Check the full Git history too. Removing a value from the latest file does not remove copies in earlier commits. If this repository has already been pushed, prepare a clean public history before publishing it.
-3. Confirm no Discord bot token, LINE channel secret, LINE access token, or other credential was committed. Keep them in Cloudflare secrets and local ignored files.
-4. Add a `LICENSE` file if you want others to have permission to reuse or modify the project. No license is included yet.
+The license applies to this project's original code. Cloudflare, Discord, LINE, Wrangler, and other third-party services or packages remain under their own terms and licenses.
+
+## Before publishing or deploying
+
+- Never commit `LINE_CHANNEL_SECRET`, `LINE_CHANNEL_ACCESS_TOKEN`, `DISCORD_BOT_TOKEN`, or webhook URLs containing tokens. Store credentials as Cloudflare secrets. `.dev.vars` and `.env` are ignored by Git.
+- `DISCORD_PUBLIC_KEY` is a public verification key, not a secret, but you must set it to the key for your own Discord application when self-hosting.
+- Check the full Git history before making the repository public. Removing a credential from the latest file does not remove it from earlier commits. If a credential was ever committed, revoke/rotate it before publishing.
+- The hosted invite links above point to Pitichod's own bot and LINE Official Account. Self-hosters must create and configure their own accounts and credentials.
 
 ## Architecture
 
