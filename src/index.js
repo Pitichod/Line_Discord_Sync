@@ -323,7 +323,6 @@ export class DiscordGateway extends DurableObject {
     const profile = source.userId ? await this.getLineProfile(source) : { displayName: "LINE user" };
     const parts = [];
     if (message.type === "text" && message.text) parts.push(message.text);
-    if (message.type === "file") parts.push(`File: ${message.fileName || "attachment"}`);
     const content = parts.join("\n").slice(0, 1900);
 
     if (["image", "video", "audio", "file"].includes(message.type)) {
@@ -444,7 +443,7 @@ export class DiscordGateway extends DurableObject {
 
   async postDiscordLineMessage(channelId, content, file, profile) {
     const metadata = await this.ctx.storage.get(`pairmeta:${channelId}`);
-    if (metadata?.guildId) {
+    if (await this.isGuildChannel(channelId, metadata)) {
       const webhook = await this.getOrCreateLineWebhook(channelId);
       if (webhook) {
         const username = `${profile.displayName || "LINE user"} (LINE)`.slice(0, 80);
@@ -456,6 +455,26 @@ export class DiscordGateway extends DurableObject {
     const prefix = `**${profile.displayName || "LINE user"} (LINE)**`;
     const fallbackContent = content ? `${prefix}\n${content}` : prefix;
     await this.postDiscordMessage(channelId, fallbackContent, file);
+  }
+
+  async isGuildChannel(channelId, metadata) {
+    if (metadata?.guildId) return true;
+    try {
+      const response = await fetch(`https://discord.com/api/v10/channels/${channelId}`, {
+        headers: { authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` },
+      });
+      if (!response.ok) {
+        console.warn("Could not check Discord channel type for LINE webhook", response.status);
+        return false;
+      }
+      const channel = await response.json();
+      if (!channel.guild_id) return false;
+      await this.ctx.storage.put(`pairmeta:${channelId}`, { ...metadata, guildId: channel.guild_id });
+      return true;
+    } catch (error) {
+      console.warn("Could not check Discord channel type for LINE webhook", error?.message || "request failed");
+      return false;
+    }
   }
 
   async getOrCreateLineWebhook(channelId) {
