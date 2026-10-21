@@ -574,7 +574,7 @@ export class DiscordGateway extends DurableObject {
     const fallbackContent = content ? `${prefix}\n${content}` : prefix;
     // Discord's incoming webhook API doesn't support message_reference; use the bot API for native replies.
     if (replyToMessageId) {
-      return this.postDiscordMessage(channelId, fallbackContent, file, replyToMessageId);
+      return this.postDiscordMessage(channelId, content, file, replyToMessageId, profile);
     }
 
     const metadata = await this.ctx.storage.get(`pairmeta:${channelId}`);
@@ -661,10 +661,15 @@ export class DiscordGateway extends DurableObject {
     }
   }
 
-  async postDiscordMessage(channelId, content, file, replyToMessageId = null) {
+  async postDiscordMessage(channelId, content, file, replyToMessageId = null, lineProfile = null) {
     const send = async (referenceId) => {
       const form = new FormData();
       const payload = { content, allowed_mentions: { parse: [] } };
+      if (lineProfile) {
+        const author = { name: `${lineProfile.displayName || "LINE user"} (LINE)`.slice(0, 256) };
+        if (lineProfile.pictureUrl?.startsWith("https://")) author.icon_url = lineProfile.pictureUrl;
+        payload.embeds = [{ author }];
+      }
       if (referenceId) payload.message_reference = { message_id: referenceId, fail_if_not_exists: false };
       form.append("payload_json", JSON.stringify(payload));
       if (file) form.append("files[0]", file.blob, file.filename);
