@@ -9,12 +9,12 @@ Cloudflare Worker bridge that supports multiple Discord server channels or DMs, 
 3. The Worker stores the channel-to-group pairing. Repeat for each Discord channel and LINE group.
 4. To remove a pairing, run `/unpair` in the paired Discord channel or DM.
 
-The bot must be installed in each Discord server and have view, read-message, send-message, and attach-file access to the selected channel. The LINE Official Account must be a member of each paired LINE group, and **Allow bot to join group chats** must be enabled.
+The bot must be installed in each Discord server and have view, read-message, send-message, attach-file, and **Manage Webhooks** access to the selected channel. Manage Webhooks lets LINE messages appear in Discord with the LINE sender's name and profile photo; without it, they fall back to a message sent by the bot with the sender's name in the text. The LINE Official Account must be a member of each paired LINE group, and **Allow bot to join group chats** must be enabled.
 
 ## Message behavior
 
-- LINE text and received media (images, video, audio, and files) are forwarded to the paired Discord channel.
-- Discord text is pushed to the paired LINE group.
+- LINE messages use a Discord webhook named for the LINE sender and their profile photo when available. For Discord DM pairings and where the bot lacks Manage Webhooks, the bridge uses a bot message with the LINE sender's name.
+- Messages from Discord use LINE's per-message sender name `Name (Discord)` and the Discord sender's profile icon when available; the chat text stays in a single bubble. LINE may append `from 'account name'` to the customized sender name.
 - JPEG and PNG attachments up to 10 MB are sent to LINE as images. Other Discord attachments are shared as links because LINE's Messaging API has no general file-send message type. Discord attachment URLs may expire.
 
 ## Configure and deploy

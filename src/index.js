@@ -320,18 +320,18 @@ export class DiscordGateway extends DurableObject {
       console.log("Ignored message from an unpaired LINE chat");
       return;
     }
-    const displayName = source.userId ? await this.getLineDisplayName(source.userId) : "LINE user";
-    const parts = [`**${displayName} (LINE)**`];
-    if (message.type === "text") parts.push(message.text || "");
+    const profile = source.userId ? await this.getLineProfile(source) : { displayName: "LINE user" };
+    const parts = [];
+    if (message.type === "text" && message.text) parts.push(message.text);
     if (message.type === "file") parts.push(`File: ${message.fileName || "attachment"}`);
     const content = parts.join("\n").slice(0, 1900);
 
     if (["image", "video", "audio", "file"].includes(message.type)) {
       const media = await this.getLineContent(message.id);
       const filename = safeFilename(message.fileName || `line-${message.type}-${message.id}.${extensionFor(media.contentType)}`);
-      await this.postDiscordMessage(channelId, content, { filename, blob: media.blob });
+      await this.postDiscordLineMessage(channelId, content, { filename, blob: media.blob }, profile);
     } else {
-      await this.postDiscordMessage(channelId, content);
+      await this.postDiscordLineMessage(channelId, content, null, profile);
     }
   }
 
@@ -384,14 +384,24 @@ export class DiscordGateway extends DurableObject {
     if (!response.ok) console.error("LINE pairing response failed", response.status, await response.text());
   }
 
-  async getLineDisplayName(userId) {
+  async getLineProfile(source) {
     try {
-      const response = await fetch(`https://api.line.me/v2/bot/profile/${encodeURIComponent(userId)}`, {
+      const userId = encodeURIComponent(source.userId);
+      let path = `/v2/bot/profile/${userId}`;
+      if (source.type === "group" && source.groupId) {
+        path = `/v2/bot/group/${encodeURIComponent(source.groupId)}/member/${userId}`;
+      } else if (source.type === "room" && source.roomId) {
+        path = `/v2/bot/room/${encodeURIComponent(source.roomId)}/member/${userId}`;
+      }
+      const response = await fetch(`https://api.line.me${path}`, {
         headers: { authorization: `Bearer ${this.env.LINE_CHANNEL_ACCESS_TOKEN}` },
       });
-      if (response.ok) return (await response.json()).displayName || "LINE user";
+      if (response.ok) {
+        const profile = await response.json();
+        return { displayName: profile.displayName || "LINE user", pictureUrl: profile.pictureUrl || null };
+      }
     } catch { /* optional profile lookup */ }
-    return "LINE user";
+    return { displayName: "LINE user" };
   }
 
   async getLineContent(messageId) {
@@ -404,18 +414,21 @@ export class DiscordGateway extends DurableObject {
 
   async relayDiscordMessage(message, target) {
     const label = message.member?.nick || message.author?.global_name || message.author?.username || "Discord user";
-    const text = message.content ? `${label} (Discord)\n${message.content}` : `${label} (Discord)`;
-    const messages = [{ type: "text", text: text.slice(0, 5000) }];
+    const avatarUrl = discordAvatarUrl(message.author);
+    const sender = makeLineSender(`${label} (Discord)`, avatarUrl);
+    const messages = [];
+    if (message.content) messages.push({ type: "text", text: message.content.slice(0, 5000), sender });
 
     for (const attachment of message.attachments || []) {
       const isImage = (attachment.content_type || "").startsWith("image/") &&
         ["image/jpeg", "image/png"].includes(attachment.content_type) && attachment.size <= 10 * 1024 * 1024;
       if (isImage && messages.length < 5) {
-        messages.push({ type: "image", originalContentUrl: attachment.url, previewImageUrl: attachment.url });
+        messages.push({ type: "image", originalContentUrl: attachment.url, previewImageUrl: attachment.url, sender });
       } else if (messages.length < 5) {
-        messages.push({ type: "text", text: `File: ${attachment.filename}\n${attachment.url}`.slice(0, 5000) });
+        messages.push({ type: "text", text: `File: ${attachment.filename}\n${attachment.url}`.slice(0, 5000), sender });
       }
     }
+    if (messages.length === 0) messages.push({ type: "text", text: "(empty message)", sender });
 
     const response = await fetch("https://api.line.me/v2/bot/message/push", {
       method: "POST",
@@ -427,6 +440,73 @@ export class DiscordGateway extends DurableObject {
     });
     if (!response.ok) console.error("LINE push failed", response.status, await response.text());
     else console.log("Discord message sent to LINE");
+  }
+
+  async postDiscordLineMessage(channelId, content, file, profile) {
+    const metadata = await this.ctx.storage.get(`pairmeta:${channelId}`);
+    if (metadata?.guildId) {
+      const webhook = await this.getOrCreateLineWebhook(channelId);
+      if (webhook) {
+        const username = `${profile.displayName || "LINE user"} (LINE)`.slice(0, 80);
+        const sent = await this.executeLineWebhook(webhook, content, file, username, profile.pictureUrl);
+        if (sent) return;
+      }
+    }
+
+    const prefix = `**${profile.displayName || "LINE user"} (LINE)**`;
+    const fallbackContent = content ? `${prefix}\n${content}` : prefix;
+    await this.postDiscordMessage(channelId, fallbackContent, file);
+  }
+
+  async getOrCreateLineWebhook(channelId) {
+    const key = `line-webhook:${channelId}`;
+    const saved = await this.ctx.storage.get(key);
+    if (saved?.id && saved?.token) return saved;
+
+    try {
+      const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/webhooks`, {
+        method: "POST",
+        headers: {
+          authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ name: "LINE Bridge" }),
+      });
+      if (!response.ok) {
+        console.warn("Could not create LINE relay webhook; using bot messages instead", response.status);
+        return null;
+      }
+      const webhook = await response.json();
+      if (!webhook.id || !webhook.token) return null;
+      const result = { id: webhook.id, token: webhook.token };
+      await this.ctx.storage.put(key, result);
+      return result;
+    } catch (error) {
+      console.warn("Could not create LINE relay webhook; using bot messages instead", error?.message || "request failed");
+      return null;
+    }
+  }
+
+  async executeLineWebhook(webhook, content, file, username, avatarUrl) {
+    try {
+      const form = new FormData();
+      const payload = { username, content };
+      if (avatarUrl?.startsWith("https://")) payload.avatar_url = avatarUrl;
+      form.append("payload_json", JSON.stringify(payload));
+      if (file) form.append("files[0]", file.blob, file.filename);
+      const response = await fetch(`https://discord.com/api/webhooks/${webhook.id}/${webhook.token}?wait=true`, {
+        method: "POST",
+        body: form,
+      });
+      if (!response.ok) {
+        console.warn("Discord LINE webhook send failed; using bot message instead", response.status, await response.text());
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.warn("Discord LINE webhook send failed; using bot message instead", error?.message || "request failed");
+      return false;
+    }
   }
 
   async postDiscordMessage(channelId, content, file) {
@@ -473,6 +553,32 @@ function hexToBytes(hex) {
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   return bytes;
+}
+
+function discordAvatarUrl(user) {
+  if (!user?.id) return null;
+  if (user.avatar) {
+    return `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=256&format=png`;
+  }
+  try {
+    const defaultAvatar = (BigInt(user.id) >> 22n) % 6n;
+    return `https://cdn.discordapp.com/embed/avatars/${defaultAvatar}.png`;
+  } catch {
+    return null;
+  }
+}
+
+function makeLineSender(name, iconUrl) {
+  let safeName = String(name || "Discord user").replace(/[\r\n]/g, " ");
+  const sourceSuffix = " (Discord)";
+  if (safeName.endsWith(sourceSuffix)) {
+    safeName = `${safeName.slice(0, 20 - sourceSuffix.length)}${sourceSuffix}`;
+  } else {
+    safeName = safeName.slice(0, 20);
+  }
+  const sender = { name: safeName || "Discord user" };
+  if (iconUrl?.startsWith("https://")) sender.iconUrl = iconUrl;
+  return sender;
 }
 
 function safeFilename(name) {
