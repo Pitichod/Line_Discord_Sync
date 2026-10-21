@@ -14,7 +14,7 @@ The bot must be installed in each Discord server and have view, read-message, se
 ## Message behavior
 
 - LINE messages use a Discord webhook named for the LINE sender and their profile photo when available. For Discord DM pairings and where the bot lacks Manage Webhooks, the bridge uses a bot message with the LINE sender's name.
-- Messages from Discord use LINE's per-message sender name `Name (Discord)` and the Discord sender's profile icon when available; the chat text stays in a single bubble. LINE may append `from 'account name'` to the customized sender name.
+- Messages from Discord use the sender's name and profile icon when available; the chat text stays in a single bubble. LINE appends `from 'account name'` to the customized sender name.
 - JPEG and PNG attachments up to 10 MB are sent to LINE as images. Other Discord attachments are shared as links because LINE's Messaging API has no general file-send message type. Discord attachment URLs may expire.
 
 ## Configure and deploy

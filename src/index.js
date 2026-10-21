@@ -415,7 +415,7 @@ export class DiscordGateway extends DurableObject {
   async relayDiscordMessage(message, target) {
     const label = message.member?.nick || message.author?.global_name || message.author?.username || "Discord user";
     const avatarUrl = discordAvatarUrl(message.author);
-    const sender = makeLineSender(`${label} (Discord)`, avatarUrl);
+    const sender = makeLineSender(label, avatarUrl);
     const messages = [];
     if (message.content) messages.push({ type: "text", text: message.content.slice(0, 5000), sender });
 
@@ -569,13 +569,7 @@ function discordAvatarUrl(user) {
 }
 
 function makeLineSender(name, iconUrl) {
-  let safeName = String(name || "Discord user").replace(/[\r\n]/g, " ");
-  const sourceSuffix = " (Discord)";
-  if (safeName.endsWith(sourceSuffix)) {
-    safeName = `${safeName.slice(0, 20 - sourceSuffix.length)}${sourceSuffix}`;
-  } else {
-    safeName = safeName.slice(0, 20);
-  }
+  const safeName = String(name || "Discord user").replace(/[\r\n]/g, " ").slice(0, 20);
   const sender = { name: safeName || "Discord user" };
   if (iconUrl?.startsWith("https://")) sender.iconUrl = iconUrl;
   return sender;
