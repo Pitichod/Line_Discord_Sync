@@ -664,11 +664,18 @@ export class DiscordGateway extends DurableObject {
   async postDiscordMessage(channelId, content, file, replyToMessageId = null, lineProfile = null) {
     const send = async (referenceId) => {
       const form = new FormData();
-      const payload = { content, allowed_mentions: { parse: [] } };
+      const payload = { allowed_mentions: { parse: [] } };
       if (lineProfile) {
         const author = { name: `${lineProfile.displayName || "LINE user"} (LINE)`.slice(0, 256) };
         if (lineProfile.pictureUrl?.startsWith("https://")) author.icon_url = lineProfile.pictureUrl;
-        payload.embeds = [{ author }];
+        const embeds = [{ author }];
+        for (let offset = 0; offset < content.length; offset += 4096) {
+          embeds[embeds.length - 1].description = content.slice(offset, offset + 4096);
+          if (offset + 4096 < content.length) embeds.push({});
+        }
+        payload.embeds = embeds;
+      } else {
+        payload.content = content;
       }
       if (referenceId) payload.message_reference = { message_id: referenceId, fail_if_not_exists: false };
       form.append("payload_json", JSON.stringify(payload));
