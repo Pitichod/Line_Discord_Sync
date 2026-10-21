@@ -404,7 +404,8 @@ export class DiscordGateway extends DurableObject {
 
   async relayDiscordMessage(message, target) {
     const label = message.member?.nick || message.author?.global_name || message.author?.username || "Discord user";
-    const messages = [{ type: "text", text: `**${label} (Discord)**\n${message.content || "(attachment)"}`.slice(0, 5000) }];
+    const text = message.content ? `${label} (Discord)\n${message.content}` : `${label} (Discord)`;
+    const messages = [{ type: "text", text: text.slice(0, 5000) }];
 
     for (const attachment of message.attachments || []) {
       const isImage = (attachment.content_type || "").startsWith("image/") &&
