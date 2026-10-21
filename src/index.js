@@ -355,6 +355,9 @@ export class DiscordGateway extends DurableObject {
     const replyToDiscordId = message.quotedMessageId
       ? await this.getDiscordMessageForLine(lineTarget, message.quotedMessageId)
       : null;
+    if (message.quotedMessageId) {
+      console.log("LINE reply mapping lookup", { found: Boolean(replyToDiscordId) });
+    }
     const parts = [];
     if (message.type === "text" && message.text) parts.push(message.text);
     const content = parts.join("\n").slice(0, 1900);
@@ -416,6 +419,7 @@ export class DiscordGateway extends DurableObject {
     const indexKey = `reply-map:${lineTarget}:${String(createdAt).padStart(13, "0")}:${discordMessageId}`;
     await this.ctx.storage.put(indexKey, { lineMessageIds: lineIds, discordMessageId, expiresAt: createdAt + 30 * 24 * 60 * 60 * 1000 });
     await this.pruneReplyMappings(lineTarget);
+    console.log("Saved cross-platform reply mapping", { lineMessageCount: lineIds.length, hasQuoteToken: Boolean(quoteToken) });
   }
 
   async pruneReplyMappings(lineTarget) {
@@ -541,6 +545,9 @@ export class DiscordGateway extends DurableObject {
 
     const quotedMessageId = message.message_reference?.message_id;
     const quoteToken = quotedMessageId ? await this.getLineQuoteTokenForDiscord(target, quotedMessageId) : null;
+    if (quotedMessageId) {
+      console.log("Discord reply mapping lookup", { found: Boolean(quoteToken) });
+    }
     if (quoteToken) messages[0].quoteToken = quoteToken;
 
     const response = await fetch("https://api.line.me/v2/bot/message/push", {
@@ -655,16 +662,23 @@ export class DiscordGateway extends DurableObject {
   }
 
   async postDiscordMessage(channelId, content, file, replyToMessageId = null) {
-    const form = new FormData();
-    const payload = { content, allowed_mentions: { parse: [] } };
-    if (replyToMessageId) payload.message_reference = { message_id: replyToMessageId, fail_if_not_exists: false };
-    form.append("payload_json", JSON.stringify(payload));
-    if (file) form.append("files[0]", file.blob, file.filename);
-    const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
-      method: "POST",
-      headers: { authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` },
-      body: form,
-    });
+    const send = async (referenceId) => {
+      const form = new FormData();
+      const payload = { content, allowed_mentions: { parse: [] } };
+      if (referenceId) payload.message_reference = { message_id: referenceId, fail_if_not_exists: false };
+      form.append("payload_json", JSON.stringify(payload));
+      if (file) form.append("files[0]", file.blob, file.filename);
+      return fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+        method: "POST",
+        headers: { authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` },
+        body: form,
+      });
+    };
+    let response = await send(replyToMessageId);
+    if (!response.ok && replyToMessageId) {
+      console.warn("Discord rejected reply reference; retrying message without reply context", response.status);
+      response = await send(null);
+    }
     if (!response.ok) {
       console.error("Discord post failed", response.status);
       return null;
