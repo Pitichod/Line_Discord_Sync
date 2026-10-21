@@ -56,7 +56,7 @@ The Discord bot needs **View Channel**, **Read Message History**, **Send Message
 
 For Discord message relaying, enable the **Message Content Intent** in the Discord Developer Portal. For LINE groups, enable **Allow bot to join group chats** and add the Official Account to each group.
 
-Before offering the hosted bot publicly, publish [PRIVACY.md](PRIVACY.md) at a public URL and enter that URL as the application's Privacy Policy URL in the Discord Developer Portal. Discord requires an application privacy policy describing data collection, use, sharing, and deletion requests. Discord also announced that apps reaching 10,000 users need review for continued access to message content, with annual reapplication; confirm the current requirements in [Discord's developer announcement](https://discord.com/blog/updated-requirements-to-how-apps-access-data-in-servers).
+Before offering the hosted bot publicly, publish [PRIVACY.md](PRIVACY.md) and [TERMS.md](TERMS.md) at public URLs and enter them as the application's Privacy Policy URL and Terms of Service URL in the Discord Developer Portal. Discord requires an application privacy policy describing data collection, use, sharing, and deletion requests. Discord also announced that apps reaching 10,000 users need review for continued access to message content, with annual reapplication; confirm the current requirements in [Discord's developer announcement](https://discord.com/blog/updated-requirements-to-how-apps-access-data-in-servers).
 
 ## Set up your own deployment
 
