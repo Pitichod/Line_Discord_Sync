@@ -15,7 +15,7 @@ Each deployment uses one LINE Official Account and one Discord bot. Pair chats i
 
 ## How pairing works
 
-1. Run `/pair` in the Discord channel or DM you want to connect. The bot returns a one-time code that expires after 10 minutes.
+1. Run `/pair` in the Discord channel or DM you want to connect. The bot returns a one-time 12-character code that expires after 10 minutes.
 2. In the LINE group or one-to-one chat with your Official Account, send `!pair CODE`.
 3. Messages now relay between those chats. Repeat to add more pairs.
 4. Run `/unpair` in the Discord channel or DM to remove its pairing.
@@ -56,7 +56,7 @@ Do not put these tokens in `wrangler.jsonc`, `.dev.vars`, or committed files. Cl
 
 ### 3. Set the Discord application public key
 
-In `wrangler.jsonc`, set `DISCORD_PUBLIC_KEY` to the **Public Key** shown in your Discord application's General Information. This is not the bot token. Remove `LEGACY_DISCORD_CHANNEL_ID` for a new deployment; it exists only to migrate an older single-channel pairing.
+In `wrangler.jsonc`, set `DISCORD_PUBLIC_KEY` to the **Public Key** shown in your Discord application's General Information. This is not the bot token. The legacy channel binding has been removed from the sample configuration; the code only uses it if you explicitly add it back for a one-time migration.
 
 ### 4. Deploy the Worker
 
@@ -122,16 +122,17 @@ npx wrangler tail
 - LINE's customized sender display always includes `from '<Official Account name>'`. This is LINE platform behavior, not text added by this Worker. See [Customize icon and display name](https://developers.line.biz/en/docs/messaging-api/icon-nickname-switch/).
 - Discord webhook identities are used only in server channels. DMs use the bot's own identity.
 - The bridge forwards messages and attachments between paired chats. Pair only chats whose members understand that their messages may be relayed to the other platform.
+- LINE attachments larger than 10 MB are skipped to keep Worker memory use bounded. The bridge posts a notice in Discord instead.
+- LINE text relayed to Discord cannot trigger Discord mentions such as `@everyone`.
 
 ## Preparing this repository for public sharing
 
 Before making this particular repository public:
 
-1. Replace the deployment-specific `DISCORD_PUBLIC_KEY` in `wrangler.jsonc` with a placeholder or remove it. A Discord public key is not a credential, but this value belongs to one application.
-2. Remove `LEGACY_DISCORD_CHANNEL_ID`; it identifies an existing Discord channel and is only needed for the original deployment's migration.
-3. Check the full Git history too. Removing a value from the latest file does not remove copies in earlier commits. If this repository has already been pushed, prepare a clean public history before publishing it.
-4. Confirm no Discord bot token, LINE channel secret, LINE access token, or other credential was committed. Keep them in Cloudflare secrets and local ignored files.
-5. Add a `LICENSE` file if you want others to have permission to reuse or modify the project. No license is included yet.
+1. `DISCORD_PUBLIC_KEY` is a public verification key, not a credential. Set it to your own application's key before deployment.
+2. Check the full Git history too. Removing a value from the latest file does not remove copies in earlier commits. If this repository has already been pushed, prepare a clean public history before publishing it.
+3. Confirm no Discord bot token, LINE channel secret, LINE access token, or other credential was committed. Keep them in Cloudflare secrets and local ignored files.
+4. Add a `LICENSE` file if you want others to have permission to reuse or modify the project. No license is included yet.
 
 ## Architecture
 

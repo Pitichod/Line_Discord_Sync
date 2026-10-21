@@ -13,7 +13,6 @@
     { "tag": "v1", "new_sqlite_classes": ["DiscordGateway"] }
   ],
   "vars": {
-    "LEGACY_DISCORD_CHANNEL_ID": "1562370482685345872",
     "DISCORD_PUBLIC_KEY": "df9e25b4f129904a259b9c956a037963ccf782b083d25bf0ed57fd521ffeeb46"
   }
 }

@@ -1,6 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 
 const encoder = new TextEncoder();
+const MAX_LINE_WEBHOOK_BYTES = 1 * 1024 * 1024;
+const MAX_DISCORD_INTERACTION_BYTES = 64 * 1024;
+const MAX_LINE_MEDIA_BYTES = 10 * 1024 * 1024;
 
 export default {
   async fetch(request, env) {
@@ -25,7 +28,14 @@ export default {
       return new Response("LINE and Discord secrets are incomplete", { status: 503 });
     }
 
-    const rawBody = await request.text();
+    let rawBody;
+    try {
+      rawBody = await readBodyLimited(request, MAX_LINE_WEBHOOK_BYTES);
+    } catch (error) {
+      return new Response(error instanceof BodyTooLargeError ? "Request body too large" : "Could not read request body", {
+        status: error instanceof BodyTooLargeError ? 413 : 400,
+      });
+    }
     const signature = request.headers.get("x-line-signature") || "";
     if (!(await verifyLineSignature(rawBody, signature, env.LINE_CHANNEL_SECRET))) {
       console.warn("Rejected LINE webhook: invalid signature");
@@ -59,9 +69,20 @@ async function handleDiscordInteraction(request, env) {
   if (!env.DISCORD_PUBLIC_KEY || !env.DISCORD_BOT_TOKEN) {
     return new Response("Discord interactions are not configured", { status: 503 });
   }
-  const rawBody = await request.text();
+  let rawBody;
+  try {
+    rawBody = await readBodyLimited(request, MAX_DISCORD_INTERACTION_BYTES);
+  } catch (error) {
+    return new Response(error instanceof BodyTooLargeError ? "Request body too large" : "Could not read request body", {
+      status: error instanceof BodyTooLargeError ? 413 : 400,
+    });
+  }
   const signature = request.headers.get("x-signature-ed25519") || "";
   const timestamp = request.headers.get("x-signature-timestamp") || "";
+  const timestampSeconds = Number(timestamp);
+  if (!Number.isFinite(timestampSeconds) || Math.abs(Date.now() / 1000 - timestampSeconds) > 5 * 60) {
+    return new Response("Expired interaction", { status: 401 });
+  }
   if (!(await verifyDiscordSignature(rawBody, signature, timestamp, env.DISCORD_PUBLIC_KEY))) {
     console.warn("Rejected Discord interaction: invalid signature");
     return new Response("Invalid signature", { status: 401 });
@@ -164,7 +185,7 @@ export class DiscordGateway extends DurableObject {
   }
 
   async createPairCode(details) {
-    const random = new Uint8Array(4);
+    const random = new Uint8Array(6);
     for (let attempt = 0; attempt < 5; attempt++) {
       crypto.getRandomValues(random);
       const code = Array.from(random, (byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
@@ -299,25 +320,35 @@ export class DiscordGateway extends DurableObject {
   }
 
   async relayLineEvent(event) {
-    if (event.webhookEventId) {
-      const duplicate = await this.ctx.storage.get(`line-event:${event.webhookEventId}`);
-      if (duplicate) return;
-      await this.ctx.storage.put(`line-event:${event.webhookEventId}`, true);
+    await this.pruneLineEventRecords();
+    const eventId = event.webhookEventId;
+    if (eventId) {
+      const duplicate = await this.ctx.storage.get(`line-event:${eventId}`);
+      if (duplicate?.expiresAt > Date.now()) return;
+      if (duplicate) await this.ctx.storage.delete(`line-event:${eventId}`);
     }
+    const markProcessed = async () => {
+      if (!eventId) return;
+      const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
+      await this.ctx.storage.put(`line-event:${eventId}`, { expiresAt });
+      await this.ctx.storage.put(`line-event-expiry:${expiresAt}:${eventId}`, eventId);
+    };
     const source = event.source || {};
     const lineTarget = source.groupId || source.roomId || source.userId;
-    if (!lineTarget) return;
+    if (!lineTarget) { await markProcessed(); return; }
 
     const message = event.message;
-    const pairMatch = message.type === "text" && /^!pair\s+([a-f0-9]{8})$/i.exec(message.text?.trim() || "");
+    const pairMatch = message.type === "text" && /^!pair\s+([a-f0-9]{12})$/i.exec(message.text?.trim() || "");
     if (pairMatch) {
       await this.completePairing(pairMatch[1].toUpperCase(), lineTarget, source.type);
+      await markProcessed();
       return;
     }
 
     const channelId = await this.getDiscordChannelForLine(lineTarget);
     if (!channelId) {
       console.log("Ignored message from an unpaired LINE chat");
+      await markProcessed();
       return;
     }
     const profile = source.userId ? await this.getLineProfile(source) : { displayName: "LINE user" };
@@ -326,11 +357,33 @@ export class DiscordGateway extends DurableObject {
     const content = parts.join("\n").slice(0, 1900);
 
     if (["image", "video", "audio", "file"].includes(message.type)) {
-      const media = await this.getLineContent(message.id);
+      let media;
+      try {
+        media = await this.getLineContent(message.id);
+      } catch (error) {
+        if (!String(error?.message || "").includes("exceeds the 10 MB relay limit")) throw error;
+        await this.postDiscordLineMessage(channelId, "[LINE attachment skipped: larger than the 10 MB relay limit]", null, profile);
+        await markProcessed();
+        return;
+      }
       const filename = safeFilename(message.fileName || `line-${message.type}-${message.id}.${extensionFor(media.contentType)}`);
       await this.postDiscordLineMessage(channelId, content, { filename, blob: media.blob }, profile);
     } else {
       await this.postDiscordLineMessage(channelId, content, null, profile);
+    }
+    await markProcessed();
+  }
+
+  async pruneLineEventRecords() {
+    const now = Date.now();
+    const entries = await this.ctx.storage.list({ prefix: "line-event-expiry:", limit: 100 });
+    for (const [key, eventId] of entries) {
+      const expiresAt = Number(key.split(":")[1]);
+      if (!Number.isFinite(expiresAt) || expiresAt > now) break;
+      const markerKey = `line-event:${eventId}`;
+      const marker = await this.ctx.storage.get(markerKey);
+      if (marker?.expiresAt <= now) await this.ctx.storage.delete(markerKey);
+      await this.ctx.storage.delete(key);
     }
   }
 
@@ -380,7 +433,7 @@ export class DiscordGateway extends DurableObject {
       },
       body: JSON.stringify({ to: target, messages: [{ type: "text", text: text.slice(0, 5000) }] }),
     });
-    if (!response.ok) console.error("LINE pairing response failed", response.status, await response.text());
+    if (!response.ok) console.error("LINE pairing response failed", response.status);
   }
 
   async getLineProfile(source) {
@@ -408,7 +461,14 @@ export class DiscordGateway extends DurableObject {
       headers: { authorization: `Bearer ${this.env.LINE_CHANNEL_ACCESS_TOKEN}` },
     });
     if (!response.ok) throw new Error(`LINE content download failed (${response.status})`);
-    return { blob: await response.blob(), contentType: response.headers.get("content-type") || "application/octet-stream" };
+    const contentLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(contentLength) && contentLength > MAX_LINE_MEDIA_BYTES) {
+      throw new Error("LINE attachment exceeds the 10 MB relay limit");
+    }
+    return {
+      blob: await readResponseBlobLimited(response, MAX_LINE_MEDIA_BYTES),
+      contentType: response.headers.get("content-type") || "application/octet-stream",
+    };
   }
 
   async relayDiscordMessage(message, target) {
@@ -509,7 +569,7 @@ export class DiscordGateway extends DurableObject {
   async executeLineWebhook(webhook, content, file, username, avatarUrl) {
     try {
       const form = new FormData();
-      const payload = { username, content };
+      const payload = { username, content, allowed_mentions: { parse: [] } };
       if (avatarUrl?.startsWith("https://")) payload.avatar_url = avatarUrl;
       form.append("payload_json", JSON.stringify(payload));
       if (file) form.append("files[0]", file.blob, file.filename);
@@ -518,7 +578,7 @@ export class DiscordGateway extends DurableObject {
         body: form,
       });
       if (!response.ok) {
-        console.warn("Discord LINE webhook send failed; using bot message instead", response.status, await response.text());
+        console.warn("Discord LINE webhook send failed; using bot message instead", response.status);
         return false;
       }
       return true;
@@ -530,14 +590,14 @@ export class DiscordGateway extends DurableObject {
 
   async postDiscordMessage(channelId, content, file) {
     const form = new FormData();
-    form.append("payload_json", JSON.stringify({ content }));
+    form.append("payload_json", JSON.stringify({ content, allowed_mentions: { parse: [] } }));
     if (file) form.append("files[0]", file.blob, file.filename);
     const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
       method: "POST",
       headers: { authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` },
       body: form,
     });
-    if (!response.ok) console.error("Discord post failed", response.status, await response.text());
+    if (!response.ok) console.error("Discord post failed", response.status);
     else console.log("LINE message sent to Discord");
   }
 }
@@ -558,7 +618,7 @@ async function verifyLineSignature(body, receivedSignature, secret) {
 
 async function verifyDiscordSignature(body, signatureHex, timestamp, publicKeyHex) {
   try {
-    if (!/^[0-9a-f]+$/i.test(signatureHex) || !/^[0-9a-f]{64}$/i.test(publicKeyHex)) return false;
+    if (!/^[0-9a-f]{128}$/i.test(signatureHex) || !/^[0-9a-f]{64}$/i.test(publicKeyHex)) return false;
     const signature = hexToBytes(signatureHex);
     const publicKey = hexToBytes(publicKeyHex);
     const key = await crypto.subtle.importKey("raw", publicKey, { name: "Ed25519" }, false, ["verify"]);
@@ -566,6 +626,52 @@ async function verifyDiscordSignature(body, signatureHex, timestamp, publicKeyHe
   } catch {
     return false;
   }
+}
+
+class BodyTooLargeError extends Error {}
+
+async function readBodyLimited(request, maxBytes) {
+  const declaredLength = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) throw new BodyTooLargeError();
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new BodyTooLargeError();
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+async function readResponseBlobLimited(response, maxBytes) {
+  const reader = response.body?.getReader();
+  if (!reader) return new Blob([]);
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error("LINE attachment exceeds the 10 MB relay limit");
+    }
+    chunks.push(value);
+  }
+  return new Blob(chunks, { type: response.headers.get("content-type") || "application/octet-stream" });
 }
 
 function hexToBytes(hex) {
