@@ -12,6 +12,7 @@ Each deployment uses one LINE Official Account and one Discord bot. Pair chats i
 - Show Discord names and profile photos as LINE message senders. LINE adds `from '<Official Account name>'` to customized sender names; this attribution is added by LINE and can't be disabled.
 - Pair and unpair chats with `/pair`, `!pair CODE`, and `/unpair`.
 - Pair multiple LINE chats and Discord channels to one deployment.
+- Preserve reply context between platforms when the original relayed message is still mapped.
 
 ## How pairing works
 
@@ -29,7 +30,7 @@ In a Discord server, `/pair` requires **Manage Channels**, **Manage Server**, or
 - A Discord application and bot
 - A LINE Official Account with a Messaging API channel
 
-The Discord bot needs View Channel, Send Messages, Attach Files, and **Manage Webhooks** in each paired server channel. Without Manage Webhooks, LINE messages use a regular bot message in Discord and won't show the LINE profile as the message author. Discord DM pairings also use the regular bot identity.
+The Discord bot needs View Channel, **Read Message History**, Send Messages, Attach Files, and **Manage Webhooks** in each paired server channel. Without Manage Webhooks, LINE messages use a regular bot message in Discord and won't show the LINE profile as the message author. Replies from LINE use the bot identity so Discord can render a native reply. Discord DM pairings also use the bot's own identity.
 
 For Discord message relaying, enable the **Message Content Intent** in the Discord Developer Portal. For LINE groups, enable **Allow bot to join group chats** and add the Official Account to each group.
 
@@ -120,10 +121,11 @@ npx wrangler tail
 
 - LINE has no general Messaging API message type for sending arbitrary files. Images from Discord are sent as LINE images when they are JPEG or PNG and no larger than 10 MB; other files are sent as links, which may expire.
 - LINE's customized sender display always includes `from '<Official Account name>'`. This is LINE platform behavior, not text added by this Worker. See [Customize icon and display name](https://developers.line.biz/en/docs/messaging-api/icon-nickname-switch/).
-- Discord webhook identities are used only in server channels. DMs use the bot's own identity.
+- Discord webhook identities are used for regular LINE messages in server channels. Replies from LINE and Discord DM pairings use the bot's own identity.
 - The bridge forwards messages and attachments between paired chats. Pair only chats whose members understand that their messages may be relayed to the other platform.
 - LINE attachments larger than 10 MB are skipped to keep Worker memory use bounded. The bridge posts a notice in Discord instead.
 - LINE text relayed to Discord cannot trigger Discord mentions such as `@everyone`.
+- Reply links are kept for the latest 500 relayed messages per paired chat, up to 30 days. LINE only provides quote tokens for supported message types, so some replies may arrive without a native quote preview.
 
 ## Preparing this repository for public sharing
 

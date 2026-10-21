@@ -352,6 +352,9 @@ export class DiscordGateway extends DurableObject {
       return;
     }
     const profile = source.userId ? await this.getLineProfile(source) : { displayName: "LINE user" };
+    const replyToDiscordId = message.quotedMessageId
+      ? await this.getDiscordMessageForLine(lineTarget, message.quotedMessageId)
+      : null;
     const parts = [];
     if (message.type === "text" && message.text) parts.push(message.text);
     const content = parts.join("\n").slice(0, 1900);
@@ -362,14 +365,17 @@ export class DiscordGateway extends DurableObject {
         media = await this.getLineContent(message.id);
       } catch (error) {
         if (!String(error?.message || "").includes("exceeds the 10 MB relay limit")) throw error;
-        await this.postDiscordLineMessage(channelId, "[LINE attachment skipped: larger than the 10 MB relay limit]", null, profile);
+        const sent = await this.postDiscordLineMessage(channelId, "[LINE attachment skipped: larger than the 10 MB relay limit]", null, profile, replyToDiscordId);
+        await this.saveReplyMapping(lineTarget, [message.id], sent?.id, message.quoteToken);
         await markProcessed();
         return;
       }
       const filename = safeFilename(message.fileName || `line-${message.type}-${message.id}.${extensionFor(media.contentType)}`);
-      await this.postDiscordLineMessage(channelId, content, { filename, blob: media.blob }, profile);
+      const sent = await this.postDiscordLineMessage(channelId, content, { filename, blob: media.blob }, profile, replyToDiscordId);
+      await this.saveReplyMapping(lineTarget, [message.id], sent?.id, message.quoteToken);
     } else {
-      await this.postDiscordLineMessage(channelId, content, null, profile);
+      const sent = await this.postDiscordLineMessage(channelId, content, null, profile, replyToDiscordId);
+      await this.saveReplyMapping(lineTarget, [message.id], sent?.id, message.quoteToken);
     }
     await markProcessed();
   }
@@ -384,6 +390,50 @@ export class DiscordGateway extends DurableObject {
       const marker = await this.ctx.storage.get(markerKey);
       if (marker?.expiresAt <= now) await this.ctx.storage.delete(markerKey);
       await this.ctx.storage.delete(key);
+    }
+  }
+
+  async getDiscordMessageForLine(lineTarget, lineMessageId) {
+    return this.ctx.storage.get(`reply-line:${lineTarget}:${lineMessageId}`);
+  }
+
+  async getLineQuoteTokenForDiscord(lineTarget, discordMessageId) {
+    const mapping = await this.ctx.storage.get(`reply-discord:${lineTarget}:${discordMessageId}`);
+    return mapping?.quoteToken || null;
+  }
+
+  async saveReplyMapping(lineTarget, lineMessageIds, discordMessageId, quoteToken) {
+    if (!discordMessageId) return;
+    const lineIds = lineMessageIds.filter(Boolean);
+    for (const lineMessageId of lineIds) {
+      await this.ctx.storage.put(`reply-line:${lineTarget}:${lineMessageId}`, discordMessageId);
+    }
+    if (quoteToken) {
+      await this.ctx.storage.put(`reply-discord:${lineTarget}:${discordMessageId}`, { quoteToken });
+    }
+
+    const createdAt = Date.now();
+    const indexKey = `reply-map:${lineTarget}:${String(createdAt).padStart(13, "0")}:${discordMessageId}`;
+    await this.ctx.storage.put(indexKey, { lineMessageIds: lineIds, discordMessageId, expiresAt: createdAt + 30 * 24 * 60 * 60 * 1000 });
+    await this.pruneReplyMappings(lineTarget);
+  }
+
+  async pruneReplyMappings(lineTarget) {
+    const now = Date.now();
+    const prefix = `reply-map:${lineTarget}:`;
+    const entries = await this.ctx.storage.list({ prefix, limit: 1000 });
+    const removeCount = Math.max(0, entries.size - 500);
+    let removed = 0;
+    for (const [key, record] of entries) {
+      if (removed >= removeCount && record?.expiresAt > now) break;
+      for (const lineMessageId of record?.lineMessageIds || []) {
+        await this.ctx.storage.delete(`reply-line:${lineTarget}:${lineMessageId}`);
+      }
+      if (record?.discordMessageId) {
+        await this.ctx.storage.delete(`reply-discord:${lineTarget}:${record.discordMessageId}`);
+      }
+      await this.ctx.storage.delete(key);
+      removed++;
     }
   }
 
@@ -489,6 +539,10 @@ export class DiscordGateway extends DurableObject {
     }
     if (messages.length === 0) messages.push({ type: "text", text: "(empty message)", sender });
 
+    const quotedMessageId = message.message_reference?.message_id;
+    const quoteToken = quotedMessageId ? await this.getLineQuoteTokenForDiscord(target, quotedMessageId) : null;
+    if (quoteToken) messages[0].quoteToken = quoteToken;
+
     const response = await fetch("https://api.line.me/v2/bot/message/push", {
       method: "POST",
       headers: {
@@ -497,24 +551,36 @@ export class DiscordGateway extends DurableObject {
       },
       body: JSON.stringify({ to: target, messages: messages.slice(0, 5) }),
     });
-    if (!response.ok) console.error("LINE push failed", response.status, await response.text());
-    else console.log("Discord message sent to LINE");
+    if (!response.ok) console.error("LINE push failed", response.status);
+    else {
+      const result = await response.json();
+      const sentMessages = result.sentMessages || [];
+      const lineMessageIds = sentMessages.map((sent) => sent.id).filter(Boolean);
+      const lineQuoteToken = sentMessages.find((sent) => sent.quoteToken)?.quoteToken || null;
+      await this.saveReplyMapping(target, lineMessageIds, message.id, lineQuoteToken);
+      console.log("Discord message sent to LINE");
+    }
   }
 
-  async postDiscordLineMessage(channelId, content, file, profile) {
+  async postDiscordLineMessage(channelId, content, file, profile, replyToMessageId = null) {
+    const prefix = `**${profile.displayName || "LINE user"} (LINE)**`;
+    const fallbackContent = content ? `${prefix}\n${content}` : prefix;
+    // Discord's incoming webhook API doesn't support message_reference; use the bot API for native replies.
+    if (replyToMessageId) {
+      return this.postDiscordMessage(channelId, fallbackContent, file, replyToMessageId);
+    }
+
     const metadata = await this.ctx.storage.get(`pairmeta:${channelId}`);
     if (await this.isGuildChannel(channelId, metadata)) {
       const webhook = await this.getOrCreateLineWebhook(channelId);
       if (webhook) {
         const username = `${profile.displayName || "LINE user"} (LINE)`.slice(0, 80);
         const sent = await this.executeLineWebhook(webhook, content, file, username, profile.pictureUrl);
-        if (sent) return;
+        if (sent) return sent;
       }
     }
 
-    const prefix = `**${profile.displayName || "LINE user"} (LINE)**`;
-    const fallbackContent = content ? `${prefix}\n${content}` : prefix;
-    await this.postDiscordMessage(channelId, fallbackContent, file);
+    return this.postDiscordMessage(channelId, fallbackContent, file, replyToMessageId);
   }
 
   async isGuildChannel(channelId, metadata) {
@@ -581,24 +647,30 @@ export class DiscordGateway extends DurableObject {
         console.warn("Discord LINE webhook send failed; using bot message instead", response.status);
         return false;
       }
-      return true;
+      return await response.json();
     } catch (error) {
       console.warn("Discord LINE webhook send failed; using bot message instead", error?.message || "request failed");
       return false;
     }
   }
 
-  async postDiscordMessage(channelId, content, file) {
+  async postDiscordMessage(channelId, content, file, replyToMessageId = null) {
     const form = new FormData();
-    form.append("payload_json", JSON.stringify({ content, allowed_mentions: { parse: [] } }));
+    const payload = { content, allowed_mentions: { parse: [] } };
+    if (replyToMessageId) payload.message_reference = { message_id: replyToMessageId, fail_if_not_exists: false };
+    form.append("payload_json", JSON.stringify(payload));
     if (file) form.append("files[0]", file.blob, file.filename);
     const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
       method: "POST",
       headers: { authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` },
       body: form,
     });
-    if (!response.ok) console.error("Discord post failed", response.status);
-    else console.log("LINE message sent to Discord");
+    if (!response.ok) {
+      console.error("Discord post failed", response.status);
+      return null;
+    }
+    console.log("LINE message sent to Discord");
+    return response.json();
   }
 }
 
