@@ -12,12 +12,17 @@ export default {
       });
     }
 
-    if (request.method !== "POST" || url.pathname !== "/line-webhook") {
+    if (request.method !== "POST") {
       return new Response("Not found", { status: 404 });
     }
 
-    if (!env.LINE_CHANNEL_SECRET || !env.LINE_CHANNEL_ACCESS_TOKEN || !env.DISCORD_BOT_TOKEN || !env.DISCORD_CHANNEL_ID) {
-      return new Response("Bridge secrets and Discord channel configuration are incomplete", { status: 503 });
+    if (url.pathname === "/discord-interactions") {
+      return handleDiscordInteraction(request, env);
+    }
+
+    if (url.pathname !== "/line-webhook") return new Response("Not found", { status: 404 });
+    if (!env.LINE_CHANNEL_SECRET || !env.LINE_CHANNEL_ACCESS_TOKEN || !env.DISCORD_BOT_TOKEN) {
+      return new Response("LINE and Discord secrets are incomplete", { status: 503 });
     }
 
     const rawBody = await request.text();
@@ -50,6 +55,67 @@ export default {
   },
 };
 
+async function handleDiscordInteraction(request, env) {
+  if (!env.DISCORD_PUBLIC_KEY || !env.DISCORD_BOT_TOKEN) {
+    return new Response("Discord interactions are not configured", { status: 503 });
+  }
+  const rawBody = await request.text();
+  const signature = request.headers.get("x-signature-ed25519") || "";
+  const timestamp = request.headers.get("x-signature-timestamp") || "";
+  if (!(await verifyDiscordSignature(rawBody, signature, timestamp, env.DISCORD_PUBLIC_KEY))) {
+    console.warn("Rejected Discord interaction: invalid signature");
+    return new Response("Invalid signature", { status: 401 });
+  }
+
+  let interaction;
+  try { interaction = JSON.parse(rawBody); } catch { return new Response("Invalid JSON", { status: 400 }); }
+  if (interaction.type === 1) return Response.json({ type: 1 });
+  if (interaction.type !== 2 || !interaction.channel_id) return Response.json({ type: 4, data: { content: "Use this command in a Discord server channel or a DM with the bot.", flags: 64 } });
+
+  const command = interaction.data?.name;
+  const channelId = interaction.channel_id;
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  const guildId = interaction.guild_id || null;
+  if (guildId && !hasChannelAdminPermission(interaction.member?.permissions)) {
+    return interactionResponse("You need Manage Channels permission to pair this server channel.");
+  }
+
+  const bridge = env.BRIDGE.get(env.BRIDGE.idFromName("main"));
+  if (command === "pair") {
+    const result = await bridge.fetch("https://bridge/pair-code", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ channelId, guildId, ownerId: userId }),
+    });
+    const payload = await result.json();
+    if (!result.ok) return interactionResponse(payload.error || "Could not create a pairing code.");
+    return interactionResponse(`Pairing code: **${payload.code}**\nIn the LINE chat you want to connect, send: \`!pair ${payload.code}\`\nThis code expires in 10 minutes.`);
+  }
+  if (command === "unpair") {
+    const result = await bridge.fetch("https://bridge/unpair-channel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ channelId, guildId, userId }),
+    });
+    const payload = await result.json();
+    return interactionResponse(payload.ok ? "That Discord channel has been unpaired." : "That channel is not paired.");
+  }
+  return interactionResponse("Unknown command.");
+}
+
+function hasChannelAdminPermission(permissions) {
+  try {
+    const allowed = (1n << 3n) | (1n << 4n) | (1n << 5n); // Administrator, Manage Channels, Manage Guild
+    return (BigInt(permissions || "0") & allowed) !== 0n;
+  } catch {
+    return false;
+  }
+}
+
+function interactionResponse(content) {
+  return Response.json({ type: 4, data: { content, flags: 64 } });
+}
+
 export class DiscordGateway extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -65,14 +131,76 @@ export class DiscordGateway extends DurableObject {
 
   async fetch(request) {
     const url = new URL(request.url);
-    if (request.method !== "POST" || url.pathname !== "/line-event") {
+    if (request.method !== "POST") {
       return new Response("Not found", { status: 404 });
     }
+    if (url.pathname === "/pair-code") {
+      const body = await request.json();
+      await this.migrateLegacyPair();
+      const channelTarget = await this.getLineTargetForChannel(body.channelId);
+      if (channelTarget) return Response.json({ error: "That Discord channel is already paired. Unpair it first." }, { status: 409 });
+      const code = await this.createPairCode(body);
+      return Response.json({ code });
+    }
+    if (url.pathname === "/unpair-channel") {
+      const { channelId, guildId, userId } = await request.json();
+      const lineTarget = await this.getLineTargetForChannel(channelId);
+      if (!lineTarget) return Response.json({ ok: false });
+      const metadata = await this.ctx.storage.get(`pairmeta:${channelId}`);
+      if (guildId && metadata?.guildId && metadata.guildId !== guildId) return Response.json({ ok: false }, { status: 403 });
+      if (!guildId && (!metadata || metadata.guildId || metadata.ownerId !== userId)) return Response.json({ ok: false }, { status: 403 });
+      await this.ctx.storage.delete(`discord:${channelId}`);
+      await this.ctx.storage.delete(`line:${lineTarget}`);
+      await this.ctx.storage.delete(`pairmeta:${channelId}`);
+      return Response.json({ ok: true });
+    }
+    if (url.pathname !== "/line-event") return new Response("Not found", { status: 404 });
     const event = await request.json();
     console.log("Handling LINE event", { messageType: event.message?.type, sourceType: event.source?.type || "unknown" });
+    await this.migrateLegacyPair();
     await this.ensureConnected();
     await this.relayLineEvent(event);
     return new Response("OK");
+  }
+
+  async createPairCode(details) {
+    const random = new Uint8Array(4);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      crypto.getRandomValues(random);
+      const code = Array.from(random, (byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
+      const key = `pending:${code}`;
+      if (!(await this.ctx.storage.get(key))) {
+        await this.ctx.storage.put(key, { ...details, expiresAt: Date.now() + 10 * 60 * 1000 });
+        return code;
+      }
+    }
+    throw new Error("Could not generate a unique pairing code");
+  }
+
+  async getLineTargetForChannel(channelId) {
+    const key = `discord:${channelId}`;
+    let lineTarget = await this.ctx.storage.get(key);
+    if (!lineTarget && this.env.LEGACY_DISCORD_CHANNEL_ID === channelId) {
+      lineTarget = await this.ctx.storage.get("lineTarget");
+      if (lineTarget) {
+        await this.ctx.storage.put(key, lineTarget);
+        await this.ctx.storage.put(`line:${lineTarget}`, channelId);
+        await this.ctx.storage.delete("lineTarget");
+      }
+    }
+    return lineTarget;
+  }
+
+  async migrateLegacyPair() {
+    const oldTarget = await this.ctx.storage.get("lineTarget");
+    if (!oldTarget || !this.env.LEGACY_DISCORD_CHANNEL_ID) return;
+    const channelKey = `discord:${this.env.LEGACY_DISCORD_CHANNEL_ID}`;
+    const lineKey = `line:${oldTarget}`;
+    if (!(await this.ctx.storage.get(channelKey)) && !(await this.ctx.storage.get(lineKey))) {
+      await this.ctx.storage.put(channelKey, oldTarget);
+      await this.ctx.storage.put(lineKey, this.env.LEGACY_DISCORD_CHANNEL_ID);
+    }
+    await this.ctx.storage.delete("lineTarget");
   }
 
   async alarm() {
@@ -128,7 +256,7 @@ export class DiscordGateway extends DurableObject {
         op: 2,
         d: {
           token: this.env.DISCORD_BOT_TOKEN,
-          intents: 1 | 512 | 32768,
+          intents: 1 | 512 | 4096 | 32768,
           properties: { os: "cloudflare-workers", browser: "line-discord-sync", device: "line-discord-sync" },
         },
       });
@@ -154,17 +282,20 @@ export class DiscordGateway extends DurableObject {
     }
     if (packet.t === "MESSAGE_CREATE") {
       const message = packet.d;
-      if (message.channel_id !== this.env.DISCORD_CHANNEL_ID || message.author?.bot || message.author?.id === this.botUserId) {
-        console.log("Ignored Discord message", { channelMatches: message.channel_id === this.env.DISCORD_CHANNEL_ID, isBot: Boolean(message.author?.bot) });
-        return;
-      }
-      console.log("Forwarding Discord message", { attachmentCount: (message.attachments || []).length });
-      await this.relayDiscordMessage(message);
+      if (message.author?.bot || message.author?.id === this.botUserId) return;
+      await this.handleDiscordMessage(message);
     }
   }
 
   sendGateway(packet) {
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(packet));
+  }
+
+  async handleDiscordMessage(message) {
+    const lineTarget = await this.getLineTargetForChannel(message.channel_id);
+    if (!lineTarget) return;
+    console.log("Forwarding Discord message", { attachmentCount: (message.attachments || []).length });
+    await this.relayDiscordMessage(message, lineTarget);
   }
 
   async relayLineEvent(event) {
@@ -176,17 +307,19 @@ export class DiscordGateway extends DurableObject {
     const source = event.source || {};
     const lineTarget = source.groupId || source.roomId || source.userId;
     if (!lineTarget) return;
-    const savedTarget = await this.ctx.storage.get("lineTarget");
-    if (savedTarget && savedTarget !== lineTarget) {
+
+    const message = event.message;
+    const pairMatch = message.type === "text" && /^!pair\s+([a-f0-9]{8})$/i.exec(message.text?.trim() || "");
+    if (pairMatch) {
+      await this.completePairing(pairMatch[1].toUpperCase(), lineTarget, source.type);
+      return;
+    }
+
+    const channelId = await this.getDiscordChannelForLine(lineTarget);
+    if (!channelId) {
       console.log("Ignored message from an unpaired LINE chat");
       return;
     }
-    if (!savedTarget) {
-      await this.ctx.storage.put("lineTarget", lineTarget);
-      console.log("Paired LINE chat with Discord channel");
-    }
-
-    const message = event.message;
     const displayName = source.userId ? await this.getLineDisplayName(source.userId) : "LINE user";
     const parts = [`**${displayName} (LINE)**`];
     if (message.type === "text") parts.push(message.text || "");
@@ -196,10 +329,59 @@ export class DiscordGateway extends DurableObject {
     if (["image", "video", "audio", "file"].includes(message.type)) {
       const media = await this.getLineContent(message.id);
       const filename = safeFilename(message.fileName || `line-${message.type}-${message.id}.${extensionFor(media.contentType)}`);
-      await this.postDiscordMessage(content, { filename, blob: media.blob });
+      await this.postDiscordMessage(channelId, content, { filename, blob: media.blob });
     } else {
-      await this.postDiscordMessage(content);
+      await this.postDiscordMessage(channelId, content);
     }
+  }
+
+  async getDiscordChannelForLine(lineTarget) {
+    let channelId = await this.ctx.storage.get(`line:${lineTarget}`);
+    if (!channelId && this.env.LEGACY_DISCORD_CHANNEL_ID && (await this.ctx.storage.get("lineTarget")) === lineTarget) {
+      channelId = this.env.LEGACY_DISCORD_CHANNEL_ID;
+      await this.ctx.storage.put(`line:${lineTarget}`, channelId);
+      await this.ctx.storage.put(`discord:${channelId}`, lineTarget);
+      await this.ctx.storage.delete("lineTarget");
+    }
+    return channelId;
+  }
+
+  async completePairing(code, lineTarget, sourceType) {
+    if (sourceType !== "group" && sourceType !== "room" && sourceType !== "user") {
+      console.log("Ignored pairing code from an unsupported LINE chat");
+      return;
+    }
+    const key = `pending:${code}`;
+    const pending = await this.ctx.storage.get(key);
+    if (!pending || pending.expiresAt < Date.now()) {
+      await this.sendLineText(lineTarget, "That pairing code is invalid or expired. Run `/pair` in Discord to get a new one.");
+      return;
+    }
+    const existingChannel = await this.ctx.storage.get(`line:${lineTarget}`);
+    const existingTarget = await this.getLineTargetForChannel(pending.channelId);
+    if (existingChannel || existingTarget) {
+      await this.sendLineText(lineTarget, "This LINE group or Discord channel is already paired. Unpair it first, then try again.");
+      return;
+    }
+    await this.ctx.storage.put(`discord:${pending.channelId}`, lineTarget);
+    await this.ctx.storage.put(`line:${lineTarget}`, pending.channelId);
+    await this.ctx.storage.put(`pairmeta:${pending.channelId}`, { guildId: pending.guildId || null, ownerId: pending.ownerId || null });
+    await this.ctx.storage.delete(key);
+    await this.sendLineText(lineTarget, "Connected to Discord. Messages and supported attachments will now sync to the paired channel.");
+    await this.postDiscordMessage(pending.channelId, "This Discord channel is now paired with the LINE group.");
+    console.log("Paired a LINE group and Discord channel");
+  }
+
+  async sendLineText(target, text) {
+    const response = await fetch("https://api.line.me/v2/bot/message/push", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${this.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ to: target, messages: [{ type: "text", text: text.slice(0, 5000) }] }),
+    });
+    if (!response.ok) console.error("LINE pairing response failed", response.status, await response.text());
   }
 
   async getLineDisplayName(userId) {
@@ -220,12 +402,7 @@ export class DiscordGateway extends DurableObject {
     return { blob: await response.blob(), contentType: response.headers.get("content-type") || "application/octet-stream" };
   }
 
-  async relayDiscordMessage(message) {
-    const target = await this.ctx.storage.get("lineTarget");
-    if (!target) {
-      console.warn("Cannot forward Discord message: no LINE chat has been paired yet");
-      return;
-    }
+  async relayDiscordMessage(message, target) {
     const label = message.member?.nick || message.author?.global_name || message.author?.username || "Discord user";
     const messages = [{ type: "text", text: `**${label} (Discord)**\n${message.content || "(attachment)"}`.slice(0, 5000) }];
 
@@ -251,11 +428,11 @@ export class DiscordGateway extends DurableObject {
     else console.log("Discord message sent to LINE");
   }
 
-  async postDiscordMessage(content, file) {
+  async postDiscordMessage(channelId, content, file) {
     const form = new FormData();
     form.append("payload_json", JSON.stringify({ content }));
     if (file) form.append("files[0]", file.blob, file.filename);
-    const response = await fetch(`https://discord.com/api/v10/channels/${this.env.DISCORD_CHANNEL_ID}/messages`, {
+    const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
       method: "POST",
       headers: { authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` },
       body: form,
@@ -277,6 +454,24 @@ async function verifyLineSignature(body, receivedSignature, secret) {
   } catch {
     return false;
   }
+}
+
+async function verifyDiscordSignature(body, signatureHex, timestamp, publicKeyHex) {
+  try {
+    if (!/^[0-9a-f]+$/i.test(signatureHex) || !/^[0-9a-f]{64}$/i.test(publicKeyHex)) return false;
+    const signature = hexToBytes(signatureHex);
+    const publicKey = hexToBytes(publicKeyHex);
+    const key = await crypto.subtle.importKey("raw", publicKey, { name: "Ed25519" }, false, ["verify"]);
+    return crypto.subtle.verify("Ed25519", key, signature, encoder.encode(timestamp + body));
+  } catch {
+    return false;
+  }
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
 }
 
 function safeFilename(name) {
