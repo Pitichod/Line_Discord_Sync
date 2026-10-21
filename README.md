@@ -1,55 +1,143 @@
 # LINE ↔ Discord Sync
 
-Cloudflare Worker bridge that supports multiple Discord server channels or DMs, each paired with a LINE group or one-to-one chat. One deployment uses one Discord bot and one LINE Official Account; each pair is configured independently.
+A two-way messaging bridge built with Cloudflare Workers. Pair LINE chats with Discord channels or direct messages, then relay text and supported attachments between them.
 
-## Pair a channel and LINE group
+Each deployment uses one LINE Official Account and one Discord bot. Pair chats independently with `/pair`.
 
-1. In the Discord server channel or DM you want to connect, run `/pair`. The command returns a private, one-time code. In a server, it requires **Manage Channels**, **Manage Server**, or **Administrator** permission; in a DM, only the user who created the pairing can remove it later.
-2. In the LINE group or one-to-one chat with the bridge's Official Account, send `!pair CODE`. For a group, add the Official Account first; for a one-to-one chat, start the chat with it first.
-3. The Worker stores the channel-to-group pairing. Repeat for each Discord channel and LINE group.
-4. To remove a pairing, run `/unpair` in the paired Discord channel or DM.
+## Features
 
-The bot must be installed in each Discord server and have view, read-message, send-message, attach-file, and **Manage Webhooks** access to the selected channel. Manage Webhooks lets LINE messages appear in Discord with the LINE sender's name and profile photo; without it, they fall back to a message sent by the bot with the sender's name in the text. The LINE Official Account must be a member of each paired LINE group, and **Allow bot to join group chats** must be enabled.
+- Relay LINE text, photos, videos, audio, and files to Discord.
+- Relay Discord text and attachments to LINE. JPEG and PNG files up to 10 MB are sent as LINE images; other Discord files are shared as links.
+- Show LINE profile names and photos in Discord server channels using a Discord webhook, when the bot has **Manage Webhooks** permission.
+- Show Discord names and profile photos as LINE message senders. LINE adds `from '<Official Account name>'` to customized sender names; this attribution is added by LINE and can't be disabled.
+- Pair and unpair chats with `/pair`, `!pair CODE`, and `/unpair`.
+- Pair multiple LINE chats and Discord channels to one deployment.
 
-## Message behavior
+## How pairing works
 
-- LINE messages use a Discord webhook named for the LINE sender and their profile photo when available. For Discord DM pairings and where the bot lacks Manage Webhooks, the bridge uses a bot message with the LINE sender's name.
-- Messages from Discord use the sender's name and profile icon when available; the chat text stays in a single bubble. LINE appends `from 'account name'` to the customized sender name.
-- JPEG and PNG attachments up to 10 MB are sent to LINE as images. Other Discord attachments are shared as links because LINE's Messaging API has no general file-send message type. Discord attachment URLs may expire.
+1. Run `/pair` in the Discord channel or DM you want to connect. The bot returns a one-time code that expires after 10 minutes.
+2. In the LINE group or one-to-one chat with your Official Account, send `!pair CODE`.
+3. Messages now relay between those chats. Repeat to add more pairs.
+4. Run `/unpair` in the Discord channel or DM to remove its pairing.
 
-## Configure and deploy
+In a Discord server, `/pair` requires **Manage Channels**, **Manage Server**, or **Administrator** permission. For a DM pairing, only the user who created the pairing can unpair it.
 
-1. Store the runtime credentials as Cloudflare secrets:
+## Requirements
 
-   ```sh
-   npx wrangler secret put LINE_CHANNEL_SECRET
-   npx wrangler secret put LINE_CHANNEL_ACCESS_TOKEN
-   npx wrangler secret put DISCORD_BOT_TOKEN
-   ```
+- Node.js and npm
+- A Cloudflare account with Workers and Durable Objects enabled
+- A Discord application and bot
+- A LINE Official Account with a Messaging API channel
 
-2. In `wrangler.jsonc`, set `DISCORD_PUBLIC_KEY` to the **Public Key** shown under your Discord application's General Information. This value is public, unlike the bot token.
-3. Deploy with `npx wrangler deploy`.
-4. In Discord Developer Portal, set **Interactions Endpoint URL** to `https://<worker-host>/discord-interactions`.
-5. Register the global `/pair` and `/unpair` commands. Set `DISCORD_APPLICATION_ID` to your Discord Application ID, then enter the bot token without echoing it and run the registration script:
+The Discord bot needs View Channel, Send Messages, Attach Files, and **Manage Webhooks** in each paired server channel. Without Manage Webhooks, LINE messages use a regular bot message in Discord and won't show the LINE profile as the message author. Discord DM pairings also use the regular bot identity.
 
-   ```sh
-   export DISCORD_APPLICATION_ID="your-application-id"
-   read -s DISCORD_BOT_TOKEN
-   export DISCORD_BOT_TOKEN
-   node scripts/register-commands.mjs
-   unset DISCORD_BOT_TOKEN DISCORD_APPLICATION_ID
-   ```
+For Discord message relaying, enable the **Message Content Intent** in the Discord Developer Portal. For LINE groups, enable **Allow bot to join group chats** and add the Official Account to each group.
 
-   The bot token is read silently in the terminal and is not written to project files.
+## Set up your own deployment
 
-6. Keep the LINE webhook URL as `https://<worker-host>/line-webhook` and leave **Use webhook** enabled in LINE Developers Console.
-7. Invite the Discord bot to each server where you want to pair channels.
+### 1. Install dependencies and authenticate Wrangler
 
-`LEGACY_DISCORD_CHANNEL_ID` is only present to carry forward the original single-channel pairing. The Worker migrates that saved pairing on the next LINE webhook. Remove that variable from `wrangler.jsonc` before publishing a clean copy of the project.
+```sh
+npm install
+npx wrangler login
+```
 
-## Implementation notes
+### 2. Add credentials as Cloudflare secrets
 
-- LINE webhook requests are validated with the channel secret; Discord interactions are validated with the application's Ed25519 public key.
-- Pairings and temporary codes are stored in the bridge Durable Object. Pair codes expire after 10 minutes.
-- The Discord Gateway subscribes to both server messages and direct messages. Users start a DM connection by opening a DM with the bot.
-- `GET /` reports that the Worker is running.
+Run each command and enter the value when Wrangler prompts you:
+
+```sh
+npx wrangler secret put LINE_CHANNEL_SECRET
+npx wrangler secret put LINE_CHANNEL_ACCESS_TOKEN
+npx wrangler secret put DISCORD_BOT_TOKEN
+```
+
+Do not put these tokens in `wrangler.jsonc`, `.dev.vars`, or committed files. Cloudflare documents encrypted Worker secrets in its [Workers secrets guide](https://developers.cloudflare.com/workers/configuration/secrets/).
+
+### 3. Set the Discord application public key
+
+In `wrangler.jsonc`, set `DISCORD_PUBLIC_KEY` to the **Public Key** shown in your Discord application's General Information. This is not the bot token. Remove `LEGACY_DISCORD_CHANNEL_ID` for a new deployment; it exists only to migrate an older single-channel pairing.
+
+### 4. Deploy the Worker
+
+```sh
+npx wrangler deploy
+```
+
+Copy the Worker URL printed by Wrangler. It will look like `https://<worker-name>.<your-subdomain>.workers.dev`.
+
+### 5. Configure Discord interactions and commands
+
+In the Discord Developer Portal, set **Interactions Endpoint URL** to:
+
+```text
+https://<worker-host>/discord-interactions
+```
+
+Register the global `/pair` and `/unpair` commands. Set the application ID, then enter your bot token silently in the terminal:
+
+```sh
+export DISCORD_APPLICATION_ID="your-application-id"
+read -s DISCORD_BOT_TOKEN
+export DISCORD_BOT_TOKEN
+npm run register-commands
+unset DISCORD_APPLICATION_ID DISCORD_BOT_TOKEN
+```
+
+The registration script sends the token to Discord's API for authentication; it does not write it to project files.
+
+### 6. Configure the LINE webhook
+
+In LINE Developers Console, set the Messaging API webhook URL to:
+
+```text
+https://<worker-host>/line-webhook
+```
+
+Enable **Use webhook**. LINE describes webhook setup in its [Messaging API bot guide](https://developers.line.biz/en/docs/messaging-api/building-bot/).
+
+### 7. Install and pair
+
+Invite the Discord bot to each server and grant the channel permissions listed above. Open a DM with the bot before using `/pair` in a Discord DM. Then follow the pairing steps above.
+
+## Local development and logs
+
+Start a local Worker with:
+
+```sh
+npx wrangler dev
+```
+
+View deployed Worker logs with:
+
+```sh
+npx wrangler tail
+```
+
+`GET /` returns a basic health response. Pairings, temporary codes, and webhook credentials are stored in the Durable Object. Pair codes expire after 10 minutes.
+
+## Known limitations
+
+- LINE has no general Messaging API message type for sending arbitrary files. Images from Discord are sent as LINE images when they are JPEG or PNG and no larger than 10 MB; other files are sent as links, which may expire.
+- LINE's customized sender display always includes `from '<Official Account name>'`. This is LINE platform behavior, not text added by this Worker. See [Customize icon and display name](https://developers.line.biz/en/docs/messaging-api/icon-nickname-switch/).
+- Discord webhook identities are used only in server channels. DMs use the bot's own identity.
+- The bridge forwards messages and attachments between paired chats. Pair only chats whose members understand that their messages may be relayed to the other platform.
+
+## Preparing this repository for public sharing
+
+Before making this particular repository public:
+
+1. Replace the deployment-specific `DISCORD_PUBLIC_KEY` in `wrangler.jsonc` with a placeholder or remove it. A Discord public key is not a credential, but this value belongs to one application.
+2. Remove `LEGACY_DISCORD_CHANNEL_ID`; it identifies an existing Discord channel and is only needed for the original deployment's migration.
+3. Check the full Git history too. Removing a value from the latest file does not remove copies in earlier commits. If this repository has already been pushed, prepare a clean public history before publishing it.
+4. Confirm no Discord bot token, LINE channel secret, LINE access token, or other credential was committed. Keep them in Cloudflare secrets and local ignored files.
+5. Add a `LICENSE` file if you want others to have permission to reuse or modify the project. No license is included yet.
+
+## Architecture
+
+- `src/index.js` handles the LINE webhook, Discord interactions, and Durable Object logic.
+- The `DiscordGateway` Durable Object keeps the Discord Gateway connection and pairing state.
+- `scripts/register-commands.mjs` registers the Discord slash commands.
+- `wrangler.jsonc` configures the Worker and Durable Object binding.
+
+Cloudflare's [Durable Objects guide](https://developers.cloudflare.com/durable-objects/get-started/) explains the stateful coordination model used by the bridge.
